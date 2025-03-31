@@ -2,6 +2,8 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <stdalign.h>
+
 #include "sw/device/lib/arch/device.h"
 #include "sw/device/lib/base/macros.h"
 #include "sw/device/lib/crypto/drivers/entropy.h"
@@ -36,6 +38,8 @@
 #include "sw/device/silicon_creator/lib/drivers/keymgr.h"
 #include "sw/device/silicon_creator/lib/drivers/kmac.h"
 #include "sw/device/silicon_creator/lib/drivers/otp.h"
+#include "sw/device/silicon_creator/lib/drivers/rstmgr.h"
+#include "sw/device/silicon_creator/lib/drivers/watchdog.h"
 #include "sw/device/silicon_creator/lib/error.h"
 #include "sw/device/silicon_creator/lib/manifest.h"
 #include "sw/device/silicon_creator/lib/otbn_boot_services.h"
@@ -132,6 +136,9 @@ static perso_blob_t perso_blob_from_host;  // Perso data host => device.
  * Certificates flash info page layout.
  */
 static uint8_t all_certs[8192];
+// 1K should be enough for the largest certificate perso LTV object.
+enum { kBufferSize = 1024 };
+static alignas(uint32_t) uint8_t cert_buffer[kBufferSize];
 static size_t uds_offset;
 static size_t cdi_0_offset;
 static size_t cdi_1_offset;
@@ -386,15 +393,13 @@ static void compute_keymgr_owner_binding(void) {
  */
 static status_t hash_certificate(const flash_ctrl_info_page_t *page,
                                  size_t offset, size_t *size) {
-  // 1K should be enough for the largest certificate perso LTV object.
-  const size_t kBufferSize = 1024;
-  uint8_t buffer[kBufferSize];
+  memset(cert_buffer, 0, sizeof(cert_buffer));
 
   // Read first word of the certificate perso LTV object (contains the size).
   perso_tlv_object_header_t objh;
   uint16_t obj_size;
-  TRY(flash_ctrl_info_read(page, offset, 1, buffer));
-  memcpy(&objh, buffer, sizeof(perso_tlv_object_header_t));
+  TRY(flash_ctrl_info_read(page, offset, 1, cert_buffer));
+  memcpy(&objh, cert_buffer, sizeof(perso_tlv_object_header_t));
   PERSO_TLV_GET_FIELD(Objh, Size, objh, &obj_size);
 
   // Validate the perso LTV object size.
@@ -402,10 +407,10 @@ static status_t hash_certificate(const flash_ctrl_info_page_t *page,
     LOG_ERROR(
         "Inconsistent certificate perso LTV object header %02x %02x at "
         "page:offset %x:%x",
-        buffer[0], buffer[1], page->base_addr, offset);
+        cert_buffer[0], cert_buffer[1], page->base_addr, offset);
     return DATA_LOSS();
   }
-  if (obj_size > sizeof(buffer)) {
+  if (obj_size > sizeof(cert_buffer)) {
     LOG_ERROR("Bad certificate perso LTV object size %d at page:offset %x:%x",
               obj_size, page->base_addr, offset);
     return DATA_LOSS();
@@ -418,8 +423,9 @@ static status_t hash_certificate(const flash_ctrl_info_page_t *page,
 
   // Read the entire perso LTV object from flash and parse it.
   perso_tlv_cert_obj_t cert_obj;
-  TRY(flash_ctrl_info_read(page, offset, util_size_to_words(obj_size), buffer));
-  TRY(perso_tlv_get_cert_obj(buffer, kBufferSize, &cert_obj));
+  TRY(flash_ctrl_info_read(page, offset, util_size_to_words(obj_size),
+                           cert_buffer));
+  TRY(perso_tlv_get_cert_obj(cert_buffer, kBufferSize, &cert_obj));
 
   hmac_sha256_update(cert_obj.cert_body_p, cert_obj.cert_body_size);
 
@@ -581,6 +587,40 @@ static status_t personalize_gen_dice_certificates(ujson_t *uj) {
   return OK_STATUS();
 }
 
+static status_t boot_data_cfg_initialize(void) {
+  // Configure the boot data OTP word.
+  if (!status_ok(manuf_individualize_device_flash_info_boot_data_cfg_check(
+          &otp_ctrl))) {
+    TRY(manuf_individualize_device_field_cfg(
+        &otp_ctrl,
+        OTP_CTRL_PARAM_CREATOR_SW_CFG_FLASH_INFO_BOOT_DATA_CFG_OFFSET));
+  }
+
+  // Loads the boot data configuration from OTP.
+  flash_ctrl_cfg_t cfg = flash_ctrl_data_default_cfg_get();
+
+  flash_ctrl_perms_t perm = {
+      .read = kMultiBitBool4False,
+      .write = kMultiBitBool4False,
+      .erase = kMultiBitBool4True,
+  };
+
+  // Erase the BootData pages. This is necessary to ensure that the owner
+  // block is written to a clean page and to avoid ECC errors in the
+  // next boot.
+  flash_ctrl_info_perms_set(&kFlashCtrlInfoPageBootData0, perm);
+  flash_ctrl_info_perms_set(&kFlashCtrlInfoPageBootData1, perm);
+  flash_ctrl_info_cfg_set(&kFlashCtrlInfoPageBootData0, cfg);
+  flash_ctrl_info_cfg_set(&kFlashCtrlInfoPageBootData1, cfg);
+
+  TRY(flash_ctrl_info_erase(&kFlashCtrlInfoPageBootData0,
+                            kFlashCtrlEraseTypePage));
+  TRY(flash_ctrl_info_erase(&kFlashCtrlInfoPageBootData1,
+                            kFlashCtrlEraseTypePage));
+
+  return OK_STATUS();
+}
+
 static status_t install_owner(void) {
   // Get the boot_data; installing the owner will write it back with the
   // ownership_state set to LockedOwner.
@@ -603,6 +643,11 @@ static status_t install_owner(void) {
   flash_ctrl_info_perms_set(&kFlashCtrlInfoPageOwnerSlot1, perm);
   flash_ctrl_info_cfg_set(&kFlashCtrlInfoPageOwnerSlot1, cfg);
 
+  //  Initializes the boot data flash configuration in OTP, and
+  //  erases the boot data pages to avoid integrity errors in the next boot.
+  // `sku_creator_owner_init` will write the owner block to the flash.
+  TRY(boot_data_cfg_initialize());
+
   // Initialize ownership.  This will write the owner block into OwnerSlot0 and
   // set the ownership_state to LockedOwner.  The first boot of the ROM_EXT
   // will create a redundanty copy in OwnerSlot1.
@@ -610,7 +655,6 @@ static status_t install_owner(void) {
   owner_config_default(&config);
   owner_application_keyring_t keyring = {0};
   TRY(sku_creator_owner_init(&boot_data, &config, &keyring));
-
   return OK_STATUS();
 }
 
@@ -681,6 +725,36 @@ static status_t extract_next_cert(uint8_t **dest, size_t *free_room) {
     perso_blob_from_host.num_objs--;
     return OK_STATUS();
   }
+
+  return OK_STATUS();
+}
+
+static status_t write_cert_to_flash_info_page(
+    const cert_flash_info_layout_t *layout, perso_tlv_cert_obj_t *block,
+    uint8_t *cert_data, uint32_t page_offset, uint32_t cert_write_size_bytes,
+    uint32_t cert_write_size_words) {
+  if ((page_offset + cert_write_size_bytes) > FLASH_CTRL_PARAM_BYTES_PER_PAGE) {
+    LOG_ERROR("%s %s certificate did not fit into the info page.",
+              layout->group_name, block->name);
+    return OUT_OF_RANGE();
+  }
+  if (sizeof(cert_buffer) < cert_write_size_bytes) {
+    LOG_ERROR("%s %s certificate did not fit into the buffer.",
+              layout->group_name, block->name);
+    return OUT_OF_RANGE();
+  }
+
+  memset(cert_buffer, 0, cert_write_size_bytes);
+
+  // Copy the actual certificate data into the cert buffer.
+  // This is necessary because flash_ctrl_info_write() requires the
+  // data source pointer to be word-aligned. The input cert_data
+  // pointer might not meet this alignment requirement, whereas
+  // cert_buffer is expected to be world-aligned.
+  memcpy(cert_buffer, cert_data, block->obj_size);
+
+  TRY(flash_ctrl_info_write(layout->info_page, page_offset,
+                            cert_write_size_words, cert_buffer));
 
   return OK_STATUS();
 }
@@ -787,14 +861,9 @@ static status_t personalize_endorse_certificates(ujson_t *uj) {
       // Round up the size to the nearest word boundary.
       uint32_t cert_size_words = util_size_to_words(block.obj_size);
       uint32_t cert_size_bytes_ru = cert_size_words * sizeof(uint32_t);
-      if ((page_offset + cert_size_bytes_ru) >
-          FLASH_CTRL_PARAM_BYTES_PER_PAGE) {
-        LOG_ERROR("%s %s certificate did not fit into the info page.",
-                  curr_layout.group_name, block.name);
-        return OUT_OF_RANGE();
-      }
-      TRY(flash_ctrl_info_write(curr_layout.info_page, page_offset,
-                                cert_size_words, next_cert));
+      TRY(write_cert_to_flash_info_page(&curr_layout, &block, next_cert,
+                                        page_offset, cert_size_bytes_ru,
+                                        cert_size_words));
       LOG_INFO("Imported %s %s certificate.", curr_layout.group_name,
                block.name);
       page_offset += cert_size_bytes_ru;
@@ -895,11 +964,25 @@ static status_t configure_ate_gpio_indicators(void) {
 }
 
 bool test_main(void) {
+  // Unconditionally disable the watchdog timer.
+  // This is needed to avoid a watchdog reset if enabled in the ROM.
+  watchdog_disable();
+
   CHECK_STATUS_OK(peripheral_handles_init());
   pinmux_testutils_init(&pinmux);
   CHECK_STATUS_OK(configure_ate_gpio_indicators());
   ujson_t uj = ujson_ottf_console();
+
   log_self_hash();
+
+  // Read the reset reason directly from the RSTMGR.
+  // This is needed to clear the reset reason before the first call to
+  // `personalize_otp_and_flash_secrets()`, which will reset the device.
+  uint32_t reason = rstmgr_reason_get();
+  if (reason != 0) {
+    rstmgr_reason_clear(reason);
+  }
+
   CHECK_STATUS_OK(lc_ctrl_testutils_operational_state_check(&lc_ctrl));
   CHECK_STATUS_OK(personalize_otp_and_flash_secrets(&uj));
   CHECK_STATUS_OK(personalize_gen_dice_certificates(&uj));

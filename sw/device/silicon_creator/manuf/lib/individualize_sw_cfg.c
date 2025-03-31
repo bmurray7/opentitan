@@ -71,16 +71,16 @@ static status_t otp_img_write(const dif_otp_ctrl_t *otp,
     // Additionally, we skip the provisioning of the AST configuration data, as
     // this should already be written to a flash info page. We will pull the
     // data directly from there.
-    if (kv[i].offset ==
-            OTP_CTRL_PARAM_CREATOR_SW_CFG_FLASH_DATA_DEFAULT_CFG_OFFSET ||
+    // clang-format off
+    if (kv[i].offset == OTP_CTRL_PARAM_CREATOR_SW_CFG_FLASH_DATA_DEFAULT_CFG_OFFSET ||
+        kv[i].offset == OTP_CTRL_PARAM_CREATOR_SW_CFG_FLASH_INFO_BOOT_DATA_CFG_OFFSET ||
         kv[i].offset == OTP_CTRL_PARAM_CREATOR_SW_CFG_MANUF_STATE_OFFSET ||
-        kv[i].offset ==
-            OTP_CTRL_PARAM_CREATOR_SW_CFG_IMMUTABLE_ROM_EXT_EN_OFFSET ||
+        kv[i].offset == OTP_CTRL_PARAM_CREATOR_SW_CFG_IMMUTABLE_ROM_EXT_EN_OFFSET ||
         kv[i].offset == OTP_CTRL_PARAM_OWNER_SW_CFG_ROM_BOOTSTRAP_DIS_OFFSET ||
-        (kv[i].offset >= kValidAstCfgOtpAddrLow &&
-         kv[i].offset < kInvalidAstCfgOtpAddrHigh)) {
+        (kv[i].offset >= kValidAstCfgOtpAddrLow && kv[i].offset < kInvalidAstCfgOtpAddrHigh)) {
       continue;
     }
+    // clang-format on
     uint32_t offset;
     TRY(dif_otp_ctrl_relative_address(partition, kv[i].offset, &offset));
     switch (kv[i].type) {
@@ -119,6 +119,10 @@ static status_t otp_img_expected_value_read(dif_otp_ctrl_partition_t partition,
   switch (field_offset) {
     case OTP_CTRL_PARAM_OWNER_SW_CFG_ROM_BOOTSTRAP_DIS_OFFSET:
       memcpy(buffer + relative_addr, &kOwnerSwCfgRomBootstrapDisValue,
+             sizeof(uint32_t));
+      break;
+    case OTP_CTRL_PARAM_CREATOR_SW_CFG_FLASH_INFO_BOOT_DATA_CFG_OFFSET:
+      memcpy(buffer + relative_addr, &kCreatorSwCfgFlashInfoBootDataCfgValue,
              sizeof(uint32_t));
       break;
     case OTP_CTRL_PARAM_CREATOR_SW_CFG_MANUF_STATE_OFFSET:
@@ -228,6 +232,10 @@ status_t manuf_individualize_device_field_cfg(const dif_otp_ctrl_t *otp_ctrl,
       field_value_addr = &kOwnerSwCfgRomBootstrapDisValue;
       partition = kDifOtpCtrlPartitionOwnerSwCfg;
       break;
+    case OTP_CTRL_PARAM_CREATOR_SW_CFG_FLASH_INFO_BOOT_DATA_CFG_OFFSET:
+      field_value_addr = &kCreatorSwCfgFlashInfoBootDataCfgValue;
+      partition = kDifOtpCtrlPartitionCreatorSwCfg;
+      break;
     case OTP_CTRL_PARAM_CREATOR_SW_CFG_FLASH_DATA_DEFAULT_CFG_OFFSET:
       field_value_addr = &kCreatorSwCfgFlashDataDefaultCfgValue;
       partition = kDifOtpCtrlPartitionCreatorSwCfg;
@@ -264,6 +272,19 @@ status_t manuf_individualize_device_flash_data_default_cfg_check(
   return is_provisioned ? OK_STATUS() : INTERNAL();
 }
 
+status_t manuf_individualize_device_flash_info_boot_data_cfg_check(
+    const dif_otp_ctrl_t *otp_ctrl) {
+  uint32_t offset;
+  TRY(dif_otp_ctrl_relative_address(
+      kDifOtpCtrlPartitionCreatorSwCfg,
+      OTP_CTRL_PARAM_CREATOR_SW_CFG_FLASH_INFO_BOOT_DATA_CFG_OFFSET, &offset));
+  uint32_t val = 0;
+  TRY(otp_ctrl_testutils_dai_read32(otp_ctrl, kDifOtpCtrlPartitionCreatorSwCfg,
+                                    offset, &val));
+  bool is_provisioned = (val == kCreatorSwCfgFlashInfoBootDataCfgValue);
+  return is_provisioned ? OK_STATUS() : INTERNAL();
+}
+
 status_t manuf_individualize_device_creator_sw_cfg_lock(
     const dif_otp_ctrl_t *otp_ctrl) {
   TRY(lock_otp_partition(otp_ctrl, kDifOtpCtrlPartitionCreatorSwCfg));
@@ -294,6 +315,10 @@ status_t manuf_individualize_device_partition_expected_read(
           buffer));
       break;
     case kDifOtpCtrlPartitionCreatorSwCfg:
+      TRY(otp_img_expected_value_read(
+          partition,
+          OTP_CTRL_PARAM_CREATOR_SW_CFG_FLASH_INFO_BOOT_DATA_CFG_OFFSET,
+          buffer));
       TRY(otp_img_expected_value_read(
           partition, OTP_CTRL_PARAM_CREATOR_SW_CFG_MANUF_STATE_OFFSET, buffer));
       TRY(otp_img_expected_value_read(
